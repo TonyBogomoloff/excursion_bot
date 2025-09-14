@@ -1,8 +1,9 @@
 import os
 import json
 import logging
+from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageReactionHandler, ContextTypes
 from dotenv import load_dotenv
 
 # Загружаем переменные окружения
@@ -18,17 +19,91 @@ logger = logging.getLogger(__name__)
 # Получаем токен бота из переменных окружения
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 
-def load_route_data():
-    """Загружает данные маршрута из route.json"""
+def log_user_action(user_id: int, action: str, details: str = ""):
+    """Логирует действия пользователя в файл"""
     try:
-        with open('route.json', 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except FileNotFoundError:
-        logger.error("Файл route.json не найден!")
-        return None
-    except json.JSONDecodeError:
-        logger.error("Ошибка при чтении route.json!")
-        return None
+        # Создаем папку users если её нет
+        users_dir = 'users'
+        if not os.path.exists(users_dir):
+            os.makedirs(users_dir)
+        
+        # Создаем папку для конкретного пользователя
+        user_dir = os.path.join(users_dir, str(user_id))
+        if not os.path.exists(user_dir):
+            os.makedirs(user_dir)
+        
+        # Путь к файлу лога
+        log_file = os.path.join(user_dir, 'actions.log')
+        
+        # Формируем запись лога
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_entry = f"[{timestamp}] {action}"
+        if details:
+            log_entry += f" - {details}"
+        log_entry += "\n"
+        
+        # Записываем в файл
+        with open(log_file, 'a', encoding='utf-8') as f:
+            f.write(log_entry)
+            
+    except Exception as e:
+        logger.error(f"Ошибка при логировании действия пользователя {user_id}: {e}")
+
+async def handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обрабатывает реакции пользователей на сообщения"""
+    try:
+        user = update.effective_user
+        message_reaction = update.message_reaction
+        
+        if not user or not message_reaction:
+            return
+        
+        # Получаем информацию о реакции
+        reactions = message_reaction.new_reaction
+        old_reactions = message_reaction.old_reaction
+        
+        # Логируем новые реакции
+        if reactions:
+            for reaction in reactions:
+                emoji = reaction.emoji if hasattr(reaction, 'emoji') else str(reaction)
+                log_user_action(
+                    user.id, 
+                    "Добавлена реакция", 
+                    f"Эмодзи: {emoji}, Сообщение ID: {message_reaction.message_id}"
+                )
+        
+        # Логируем удаленные реакции
+        if old_reactions:
+            for reaction in old_reactions:
+                emoji = reaction.emoji if hasattr(reaction, 'emoji') else str(reaction)
+                log_user_action(
+                    user.id, 
+                    "Удалена реакция", 
+                    f"Эмодзи: {emoji}, Сообщение ID: {message_reaction.message_id}"
+                )
+                
+    except Exception as e:
+        logger.error(f"Ошибка при обработке реакции: {e}")
+
+def get_locations_from_data():
+    """Получает список локаций из папки data в алфавитном порядке"""
+    try:
+        data_path = 'data'
+        if not os.path.exists(data_path):
+            logger.error("Папка data не найдена!")
+            return []
+        
+        # Получаем все папки в data и сортируем их
+        locations = []
+        for item in os.listdir(data_path):
+            item_path = os.path.join(data_path, item)
+            if os.path.isdir(item_path):
+                locations.append(item)
+        
+        return sorted(locations)  # Сортируем в алфавитном порядке
+    except Exception as e:
+        logger.error(f"Ошибка при получении локаций из папки data: {e}")
+        return []
 
 def get_location_text(location_name):
     """Получает текст из первого .txt файла в папке локации"""
@@ -96,63 +171,20 @@ def get_location_audio(location_name):
         logger.error(f"Ошибка при получении аудиофайла локации: {e}")
         return None
 
-def get_navigation_stack(context: ContextTypes.DEFAULT_TYPE):
-    """Получает стек навигации из контекста"""
-    if 'navigation_stack' not in context.user_data:
-        context.user_data['navigation_stack'] = []
-    return context.user_data['navigation_stack']
 
-def push_to_navigation_stack(context: ContextTypes.DEFAULT_TYPE, location_name: str):
-    """Добавляет локацию в стек навигации"""
-    stack = get_navigation_stack(context)
-    if not stack or stack[-1] != location_name:  # Не добавляем дубликаты
-        stack.append(location_name)
-
-def pop_from_navigation_stack(context: ContextTypes.DEFAULT_TYPE):
-    """Удаляет последнюю локацию из стека и возвращает предыдущую"""
-    stack = get_navigation_stack(context)
-    if len(stack) > 1:
-        stack.pop()  # Удаляем текущую локацию
-        return stack[-1] if stack else None
-    return None
-
-def get_message_history(context: ContextTypes.DEFAULT_TYPE):
-    """Получает историю сообщений из контекста"""
-    if 'message_history' not in context.user_data:
-        context.user_data['message_history'] = []
-    return context.user_data['message_history']
-
-def add_to_message_history(context: ContextTypes.DEFAULT_TYPE, message_id: int):
-    """Добавляет ID сообщения в историю"""
-    history = get_message_history(context)
-    history.append(message_id)
-
-def clear_message_history(context: ContextTypes.DEFAULT_TYPE):
-    """Очищает историю сообщений"""
-    context.user_data['message_history'] = []
-
-async def delete_previous_messages(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    """Удаляет все предыдущие сообщения из истории"""
-    history = get_message_history(context)
-    for message_id in history:
-        try:
-            await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
-        except Exception as e:
-            logger.warning(f"Не удалось удалить сообщение {message_id}: {e}")
-    clear_message_history(context)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Отправляет приветственное сообщение при команде /start"""
     user = update.effective_user
     
-    # Очищаем историю сообщений при команде /start
-    clear_message_history(context)
+    # Логируем действие
+    log_user_action(user.id, "Команда /start", f"Пользователь: {user.first_name} (@{user.username})")
     
     # Создаем кнопку
     keyboard = [[InlineKeyboardButton("Начнём! 🚀", callback_data='start_excursion')]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    start_message = await update.message.reply_html(
+    await update.message.reply_html(
         f"Привет, {user.mention_html()}! 👋\n\n"
         f"Добро пожаловать в наш туристический бот! 🗺️\n"
         f"Я готов помочь тебе с путешествиями и туризмом.\n\n"
@@ -160,11 +192,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         reply_markup=reply_markup,
         disable_notification=True
     )
-    
-    # Добавляем ID приветственного сообщения в историю
-    add_to_message_history(context, start_message.message_id)
 
-async def show_location(update: Update, context: ContextTypes.DEFAULT_TYPE, location_name: str, is_back_navigation: bool = False) -> None:
+async def show_location(update: Update, context: ContextTypes.DEFAULT_TYPE, location_name: str) -> None:
     """Показывает информацию о локации с кнопками навигации"""
     # Получаем текст локации
     location_text = get_location_text(location_name)
@@ -172,33 +201,26 @@ async def show_location(update: Update, context: ContextTypes.DEFAULT_TYPE, loca
         await update.callback_query.edit_message_text("❌ Ошибка при загрузке информации о локации!")
         return
     
-    # Загружаем данные маршрута для получения доступных локаций
-    route_data = load_route_data()
-    if not route_data:
-        await update.callback_query.edit_message_text("❌ Ошибка при загрузке маршрута!")
+    # Получаем список всех локаций
+    all_locations = get_locations_from_data()
+    if not all_locations:
+        await update.callback_query.edit_message_text("❌ Локации не найдены!")
         return
     
-    # Обновляем стек навигации
-    if not is_back_navigation:
-        push_to_navigation_stack(context, location_name)
     
-    # Получаем доступные локации для текущей локации
-    available_locations = route_data.get(location_name, [])
+    # Находим текущую позицию в списке локаций
+    current_index = all_locations.index(location_name) if location_name in all_locations else -1
     
     # Создаем кнопки для навигации
     keyboard = []
-    if available_locations:
-        for loc in available_locations:
-            keyboard.append([InlineKeyboardButton(f"📍 {loc}", callback_data=f'location_{loc}')])
     
-    # Добавляем кнопку "Назад" если есть предыдущая локация в стеке
-    stack = get_navigation_stack(context)
-    if len(stack) > 1:
-        keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data='back_navigation')])
+    # Кнопка "Следующая локация" если есть следующая
+    if current_index < len(all_locations) - 1:
+        next_location = all_locations[current_index + 1]
+        keyboard.append([InlineKeyboardButton(f"➡️ Следующая: {next_location}", callback_data=f'location_{next_location}')])
     
-    # Добавляем кнопку "Начать заново" если это конечная локация
-    end_location = route_data.get('end')
-    if location_name == end_location:
+    # Добавляем кнопку "Начать заново" если это последняя локация
+    if current_index == len(all_locations) - 1:
         keyboard.append([InlineKeyboardButton("🔄 Начать заново", callback_data='start_excursion')])
     
     reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
@@ -210,12 +232,6 @@ async def show_location(update: Update, context: ContextTypes.DEFAULT_TYPE, loca
     # Отправляем информацию о локации
     message = f"🎯 **{location_name}**\n\n{location_text}"
     
-    # Сохраняем старую историю сообщений для удаления
-    old_message_history = get_message_history(context).copy()
-    
-    # Очищаем историю для новых сообщений
-    clear_message_history(context)
-    
     try:
         # Отправляем изображения если есть
         if images:
@@ -226,84 +242,59 @@ async def show_location(update: Update, context: ContextTypes.DEFAULT_TYPE, loca
                     media_group.append(InputMediaPhoto(media=photo))
             
             # Отправляем все изображения группой
-            sent_messages = await context.bot.send_media_group(
+            await context.bot.send_media_group(
                 chat_id=update.effective_chat.id,
                 media=media_group,
                 disable_notification=True
             )
-            
-            # Добавляем ID всех отправленных изображений в историю
-            for sent_message in sent_messages:
-                add_to_message_history(context, sent_message.message_id)
         
         # Отправляем текстовое сообщение с кнопками
-        text_message = await context.bot.send_message(
+        await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text=message,
             parse_mode='Markdown',
             reply_markup=reply_markup,
             disable_notification=True
         )
-        
-        # Добавляем ID текстового сообщения в историю
-        add_to_message_history(context, text_message.message_id)
         
         # Отправляем аудиофайл если есть
         if audio_file:
             with open(audio_file, 'rb') as audio:
-                audio_message = await context.bot.send_audio(
+                await context.bot.send_audio(
                     chat_id=update.effective_chat.id,
                     audio=audio,
                     disable_notification=True
                 )
-                add_to_message_history(context, audio_message.message_id)
-        
-        # Удаляем только старые сообщения
-        for message_id in old_message_history:
-            try:
-                await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=message_id)
-            except Exception as e:
-                logger.warning(f"Не удалось удалить старое сообщение {message_id}: {e}")
                 
     except Exception as e:
         logger.error(f"Ошибка при отправке медиа: {e}")
         # Если ошибка с медиа, отправляем только текст
-        text_message = await context.bot.send_message(
+        await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text=message,
             parse_mode='Markdown',
             reply_markup=reply_markup,
             disable_notification=True
         )
-        add_to_message_history(context, text_message.message_id)
-        
-        # Удаляем только старые сообщения даже при ошибке
-        for message_id in old_message_history:
-            try:
-                await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=message_id)
-            except Exception as e:
-                logger.warning(f"Не удалось удалить старое сообщение {message_id}: {e}")
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обрабатывает нажатие кнопки"""
     query = update.callback_query
+    user = update.effective_user
     await query.answer()
     
+    # Логируем нажатие кнопки
+    log_user_action(user.id, "Нажата кнопка", f"Кнопка: {query.data}")
+    
     if query.data == 'start_excursion':
-        # Очищаем стек навигации при начале новой экскурсии
-        context.user_data['navigation_stack'] = []
-        
-        # Загружаем данные маршрута
-        route_data = load_route_data()
-        if not route_data:
-            await query.edit_message_text("❌ Ошибка при загрузке маршрута!")
+        # Получаем список всех локаций
+        all_locations = get_locations_from_data()
+        if not all_locations:
+            await query.edit_message_text("❌ Локации не найдены!")
             return
         
-        # Получаем стартовую локацию
-        start_location = route_data.get('start')
-        if not start_location:
-            await query.edit_message_text("❌ Стартовая локация не найдена!")
-            return
+        # Получаем первую локацию (стартовую)
+        start_location = all_locations[0]
         
         # Показываем стартовую локацию (show_location сама удалит предыдущие сообщения)
         await show_location(update, context, start_location)
@@ -315,37 +306,16 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # Показываем новую локацию
         await show_location(update, context, location_name)
     
-    elif query.data == 'back_navigation':
-        # Возвращаемся к предыдущей локации
-        previous_location = pop_from_navigation_stack(context)
-        if previous_location:
-            await show_location(update, context, previous_location, is_back_navigation=True)
-        else:
-            await query.edit_message_text("❌ Нет предыдущей локации!")
 
 async def show_all_locations(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Показывает все доступные локации с кнопками для быстрого перехода"""
-    # Загружаем данные маршрута
-    route_data = load_route_data()
-    if not route_data:
-        await update.message.reply_text("❌ Ошибка при загрузке маршрута!")
-        return
+    user = update.effective_user
     
-    # Получаем все локации (исключаем 'start' и 'end', но включаем их значения)
-    all_locations = []
-    for key in route_data.keys():
-        if key not in ['start', 'end']:
-            all_locations.append(key)
+    # Логируем действие
+    log_user_action(user.id, "Команда /show_all_locations")
     
-    # Добавляем стартовую и конечную локации по их значениям
-    start_location = route_data.get('start')
-    end_location = route_data.get('end')
-    
-    if start_location and start_location not in all_locations:
-        all_locations.append(start_location)
-    if end_location and end_location not in all_locations:
-        all_locations.append(end_location)
-    
+    # Получаем список всех локаций из папки data
+    all_locations = get_locations_from_data()
     if not all_locations:
         await update.message.reply_text("❌ Локации не найдены!")
         return
@@ -361,29 +331,53 @@ async def show_all_locations(update: Update, context: ContextTypes.DEFAULT_TYPE)
     for i, location in enumerate(all_locations, 1):
         message_text += f"{i}. {location}\n"
     
-    # Очищаем историю сообщений
-    clear_message_history(context)
-    
-    location_message = await update.message.reply_text(
+    await update.message.reply_text(
         message_text,
         parse_mode='Markdown',
         reply_markup=reply_markup,
         disable_notification=True
     )
+
+async def map_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отправляет карту маршрута пользователю"""
+    user = update.effective_user
     
-    # Добавляем ID сообщения в историю
-    add_to_message_history(context, location_message.message_id)
+    # Логируем действие
+    log_user_action(user.id, "Команда /map")
+    
+    try:
+        # Проверяем существование файла карты
+        map_path = 'map.jpg'
+        if not os.path.exists(map_path):
+            await update.message.reply_text("❌ Карта маршрута не найдена!", disable_notification=True)
+            return
+        
+        # Отправляем карту
+        with open(map_path, 'rb') as photo:
+            await update.message.reply_photo(
+                photo=photo,
+                caption="🗺️ **Карта маршрута**\n\nВот общая карта всех локаций экскурсии!",
+                parse_mode='Markdown',
+                disable_notification=True
+            )
+    except Exception as e:
+        logger.error(f"Ошибка при отправке карты: {e}")
+        await update.message.reply_text("❌ Ошибка при загрузке карты!", disable_notification=True)
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Отправляет справку по командам"""
+    user = update.effective_user
+    
+    # Логируем действие
+    log_user_action(user.id, "Команда /help")
+    
     help_text = """
 🤖 Доступные команды:
 
 /start - Начать работу с ботом
 /show_all_locations - Показать все локации для быстрого перехода
+/map - Показать карту маршрута
 /help - Показать эту справку
-
-Нажми кнопку "Начнём!" чтобы начать экскурсию! 🚀
     """
     await update.message.reply_text(help_text, disable_notification=True)
 
@@ -393,6 +387,7 @@ async def post_init(application: Application) -> None:
     commands = [
         ("start", "Начать работу с ботом"),
         ("show_all_locations", "Показать все локации"),
+        ("map", "Показать карту маршрута"),
         ("help", "Показать справку")
     ]
     await application.bot.set_my_commands(commands)
@@ -410,10 +405,14 @@ def main() -> None:
     # Добавляем обработчики команд
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("show_all_locations", show_all_locations))
+    application.add_handler(CommandHandler("map", map_command))
     application.add_handler(CommandHandler("help", help_command))
     
     # Добавляем обработчик кнопок
     application.add_handler(CallbackQueryHandler(button_callback))
+    
+    # Добавляем обработчик реакций
+    application.add_handler(MessageReactionHandler(handle_reaction))
     
     # Запускаем бота
     logger.info("Бот запускается...")
